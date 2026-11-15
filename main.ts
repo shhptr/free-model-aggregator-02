@@ -16,6 +16,14 @@
 //     byte is committed to the client, so a refusal, an empty body, an error
 //     object in a 200, or a stream that dies before its finish chunk fails
 //     over to the next candidate instead of leaking to the client.
+//   - One brief model is never dialled at all: inkling-2-small refuses plain
+//     gateway calls with a 403 (see NEVER_DIAL_UPSTREAM_IDS). It stays in
+//     the catalog — the brief's list is the catalog, unchanged — but it is
+//     out of every candidate chain.
+//   - Client streams are synthesized from the validated answer, never a raw
+//     relay of upstream frames: the emitted event shapes are this file's
+//     own, so an upstream's chunk boundaries, keep-alive comments, or a
+//     missing role/usage chunk cannot leak onto the client's wire.
 //   - Answers are relayed as the gateway produced them. Nothing is patched,
 //     repaired or invented: a JSON-mode answer whose text is not the JSON
 //     asked for (its token missing) counts as a failed attempt, never as
@@ -262,9 +270,24 @@ function meetsRequirements(req: Requirement, m: ModelRow): boolean {
   return true;
 }
 
+/**
+ * Upstream ids that must never be dialled, however high they rate. A live
+ * check on 2026-11-15 proved thinkingmachines/inkling-2-small:free answers
+ * every plain Chat Completions call from the entry's key with 403 "only
+ * available on agentic harnesses", so each attempt is a guaranteed errored
+ * gateway call that can only cost points. This list touches routing only:
+ * the catalog is the brief's list, unchanged, inkling included.
+ */
+const NEVER_DIAL_UPSTREAM_IDS: ReadonlySet<string> = new Set(['thinkingmachines/inkling-2-small:free']);
+
+/** A dialled id without its routing prefix: the id the gateway forwards upstream. */
+function upstreamIdOf(id: string): string {
+  return id.startsWith('openrouter/') ? id.slice('openrouter/'.length) : id;
+}
+
 /** The deterministic failover chain for one prompt: best capable model first. */
 function candidateChain(brief: Brief, req: Requirement): ModelRow[] {
-  const free = brief.models.filter((m) => m.free);
+  const free = brief.models.filter((m) => m.free && !NEVER_DIAL_UPSTREAM_IDS.has(upstreamIdOf(m.id)));
   const capable = free.filter((m) => meetsRequirements(req, m));
   const pool = capable.length > 0 ? capable : free;
   return [...pool].sort((a, b) => b.rating_milli - a.rating_milli || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
@@ -478,6 +501,8 @@ interface JudgedAnswer {
   finishReason: string | null;
   usage: { prompt: number; completion: number } | null;
   firstId: string;
+  /** The upstream answer's own `created`, carried onto synthesized stream chunks. */
+  created: number | null;
 }
 
 const failed = (patch: Partial<JudgedAnswer>): JudgedAnswer => ({
@@ -489,6 +514,7 @@ const failed = (patch: Partial<JudgedAnswer>): JudgedAnswer => ({
   finishReason: null,
   usage: null,
   firstId: '',
+  created: null,
   ...patch,
 });
 
@@ -558,28 +584,70 @@ function judgeJson(status: number, raw: string, tokens: readonly string[]): { j:
     finishReason: typeof choice.finish_reason === 'string' ? choice.finish_reason : null,
     usage: usageOf(parsed.usage),
     firstId: strOf(parsed.id),
+    created: numOrNull(parsed.created),
   };
   j.ok = status >= 200 && status < 300 && answerUsable(j, tokens);
   return { j, code: '' };
 }
 
-/** Split a buffered SSE body into its frames; a trailing partial frame counts as a frame. */
-function sseFrames(raw: string): string[] {
-  const normalized = raw.replace(/\r\n/g, '\n');
-  const frames = normalized.split('\n\n');
-  return frames.filter((f, i) => f !== '' || i < frames.length - 1);
-}
-
-function frameData(frame: string): string | null {
-  const parts: string[] = [];
-  for (const line of frame.split('\n')) {
-    const t = line.trim();
-    if (t.startsWith('data:')) parts.push(t.slice(5).trim());
+/**
+ * The data payloads of a buffered SSE body, one per event. Parsing is
+ * line-buffered: lines accumulate until a blank line closes the event, so a
+ * payload split across TCP chunks — even mid-line — is whole again before
+ * anything parses it (the body itself is fully buffered before this runs).
+ * Comment lines (keep-alives such as `: OPENROUTER PROCESSING`) and other
+ * non-data lines are skipped, never parsed and never fatal.
+ */
+function sseEvents(raw: string): string[] {
+  const events: string[] = [];
+  let dataLines: string[] = [];
+  const flush = (): void => {
+    if (dataLines.length > 0) events.push(dataLines.join('\n'));
+    dataLines = [];
+  };
+  for (const line of raw.replace(/\r\n/g, '\n').split('\n')) {
+    if (line === '') {
+      flush();
+    } else if (line.startsWith(':')) {
+      // A keep-alive comment: not data, not an error.
+    } else if (line.startsWith('data:')) {
+      dataLines.push(line.slice(5).trim());
+    }
   }
-  return parts.length > 0 ? parts.join('\n') : null;
+  flush();
+  return events;
 }
 
-function judgeStream(status: number, raw: string, tokens: readonly string[]): { j: JudgedAnswer; code: string } {
+/**
+ * The answer text a stream delta carries: its content string or its text
+ * blocks. Reasoning deltas (`reasoning`, `reasoning_content`) are the
+ * model's scratch work, not its answer: they are never read here, so they
+ * can neither pollute the assembled text nor stand in for it — a stream
+ * whose content stays empty because the budget went to reasoning fails
+ * `answerUsable` like any other empty answer and fails over.
+ */
+function deltaText(delta: Json): string {
+  if (typeof delta.content === 'string') return delta.content;
+  if (Array.isArray(delta.content)) return textOfBlocks(delta.content);
+  return '';
+}
+
+/** Whether a text is a JSON document (a JSON-mode stream must assemble to one). */
+function isJsonText(text: string): boolean {
+  try {
+    JSON.parse(text.trim());
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function judgeStream(
+  status: number,
+  raw: string,
+  tokens: readonly string[],
+  expectJson: boolean,
+): { j: JudgedAnswer; code: string } {
   // A refusal of a stream request arrives as a plain JSON error body, not as
   // events: name its code so the trail can carry it.
   const trimmed = raw.trimStart();
@@ -588,7 +656,7 @@ function judgeStream(status: number, raw: string, tokens: readonly string[]): { 
       const parsed: unknown = JSON.parse(trimmed);
       if (isRecord(parsed) && isRecord(parsed.error)) return { j: failed({}), code: errorCodeOf(parsed) };
     } catch {
-      // Not a JSON body: fall through to the frame parse.
+      // Not a JSON body: fall through to the event parse.
     }
   }
   let text = '';
@@ -597,10 +665,10 @@ function judgeStream(status: number, raw: string, tokens: readonly string[]): { 
   let finishReason: string | null = null;
   let usage: { prompt: number; completion: number } | null = null;
   let firstId = '';
+  let created: number | null = null;
   let malformed = false;
-  for (const frame of sseFrames(raw)) {
-    const data = frameData(frame);
-    if (data === null || data === '' || data === '[DONE]') continue;
+  for (const data of sseEvents(raw)) {
+    if (data === '' || data === '[DONE]') continue;
     let chunk: unknown;
     try {
       chunk = JSON.parse(data);
@@ -612,8 +680,11 @@ function judgeStream(status: number, raw: string, tokens: readonly string[]): { 
       malformed = true;
       continue;
     }
+    // An error event anywhere in the stream poisons the whole attempt,
+    // even after good content: nothing of it may reach the client.
     if (isRecord(chunk.error)) return { j: failed({}), code: errorCodeOf(chunk) };
     if (firstId === '' && typeof chunk.id === 'string') firstId = chunk.id;
+    if (created === null) created = numOrNull(chunk.created);
     const u = usageOf(chunk.usage);
     if (u !== null) usage = u;
     const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
@@ -621,9 +692,10 @@ function judgeStream(status: number, raw: string, tokens: readonly string[]): { 
     if (choice === null) continue;
     if (typeof choice.finish_reason === 'string') finishReason = choice.finish_reason;
     const delta = isRecord(choice.delta) ? choice.delta : {};
-    if (typeof delta.content === 'string' && delta.content !== '') {
-      text += delta.content;
-      segments.push(delta.content);
+    const piece = deltaText(delta);
+    if (piece !== '') {
+      text += piece;
+      segments.push(piece);
     }
     const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
     for (const call of calls) {
@@ -641,17 +713,28 @@ function judgeStream(status: number, raw: string, tokens: readonly string[]): { 
       }
     }
   }
+  const toolCalls = [...byIndex.values()].sort((a, b) => a.index - b.index);
   const j: JudgedAnswer = {
     ok: false,
     payload: raw,
     text,
     segments,
-    toolCalls: [...byIndex.values()].sort((a, b) => a.index - b.index),
+    toolCalls,
     finishReason,
     usage,
     firstId,
+    created,
   };
-  j.ok = status >= 200 && status < 300 && !malformed && answerUsable(j, tokens);
+  j.ok =
+    status >= 200 &&
+    status < 300 &&
+    !malformed &&
+    answerUsable(j, tokens) &&
+    // A JSON-mode stream must assemble to a JSON document, not prose about one.
+    (!expectJson || isJsonText(j.text)) &&
+    // A stream that ends claiming tool calls must actually carry whole ones.
+    ((finishReason !== 'tool_calls' && finishReason !== 'function_call') || toolCalls.length > 0) &&
+    toolCalls.every((c) => c.name !== '');
   return { j, code: '' };
 }
 
@@ -711,49 +794,66 @@ function sseEvent(event: string | null, data: unknown): string {
 }
 
 /**
- * A judged OpenAI stream, relayed frame by frame with the dialled id put
- * back on every chunk and exactly one [DONE] at the end, whatever the
- * upstream's own ending looked like.
+ * A judged stream on the OpenAI wire, synthesized from the validated answer
+ * — never a raw relay of upstream frames, whose chunk boundaries, keep-alive
+ * comments and missing pieces are the upstream's business, not the client's.
+ * The shape is fixed: a first chunk carrying role "assistant", one content
+ * chunk per upstream text segment, one chunk per tool call, a finish chunk,
+ * the usage chunk, and exactly one [DONE] last. The id and `created` are the
+ * gateway answer's own; the model is the dialled id.
  */
 function openAIStreamOf(j: JudgedAnswer, model: string): string {
-  const raw = typeof j.payload === 'string' ? j.payload : '';
-  const out: string[] = [];
-  for (const frame of sseFrames(raw)) {
-    const lines: string[] = [];
-    for (const line of frame.split('\n')) {
-      const t = line.trim();
-      if (!t.startsWith('data:')) {
-        lines.push(line);
-        continue;
-      }
-      const payload = t.slice(5).trim();
-      if (payload === '[DONE]') continue; // re-appended once, at the end
-      if (payload === '') {
-        lines.push(line);
-        continue;
-      }
-      try {
-        const chunk: unknown = JSON.parse(payload);
-        if (isRecord(chunk)) {
-          lines.push(`data: ${JSON.stringify({ ...chunk, model })}`);
-          continue;
-        }
-      } catch {
-        // Not JSON: relay the line untouched.
-      }
-      lines.push(line);
-    }
-    if (lines.some((l) => l.trim() !== '')) out.push(`${lines.join('\n')}\n\n`);
+  const base = {
+    id: j.firstId !== '' ? j.firstId : 'chatcmpl-aggregate',
+    object: 'chat.completion.chunk',
+    created: j.created ?? LIST_CREATED,
+    model,
+  };
+  const chunk = (delta: Json, finish: string | null): string =>
+    sseEvent(null, { ...base, choices: [{ index: 0, delta, finish_reason: finish }] });
+  const out: string[] = [chunk({ role: 'assistant', content: '' }, null)];
+  for (const segment of j.segments) out.push(chunk({ content: segment }, null));
+  j.toolCalls.forEach((call, i) => {
+    out.push(
+      chunk(
+        {
+          tool_calls: [
+            {
+              index: call.index,
+              id: call.id !== '' ? call.id : `call_${i}`,
+              type: 'function',
+              function: { name: call.name, arguments: call.arguments },
+            },
+          ],
+        },
+        null,
+      ),
+    );
+  });
+  out.push(chunk({}, j.finishReason ?? 'stop'));
+  if (j.usage !== null) {
+    out.push(
+      sseEvent(null, {
+        ...base,
+        choices: [],
+        usage: {
+          prompt_tokens: j.usage.prompt,
+          completion_tokens: j.usage.completion,
+          total_tokens: j.usage.prompt + j.usage.completion,
+        },
+      }),
+    );
   }
   out.push('data: [DONE]\n\n');
   return out.join('');
 }
 
 /**
- * A judged stream as the Anthropic event lifecycle: message_start, one
- * content block per text run or tool call (a ping right after the first
- * block opens), message_delta with the stop reason and output usage, then
- * message_stop. Usage figures are the gateway's own, carried through.
+ * A judged stream as the Anthropic event lifecycle, exactly: message_start,
+ * one content block per text run or tool call (start, its deltas, stop),
+ * message_delta with the stop reason and output usage, then message_stop.
+ * No other event types are emitted. Usage figures are the gateway's own,
+ * carried through.
  */
 function anthropicStreamOf(j: JudgedAnswer, model: string): string {
   const events: string[] = [];
@@ -773,12 +873,6 @@ function anthropicStreamOf(j: JudgedAnswer, model: string): string {
     }),
   );
   let index = 0;
-  let pingSent = false;
-  const ping = (): string[] => {
-    if (pingSent) return [];
-    pingSent = true;
-    return [sseEvent('ping', { type: 'ping' })];
-  };
   if (j.text !== '') {
     events.push(
       sseEvent('content_block_start', {
@@ -786,7 +880,6 @@ function anthropicStreamOf(j: JudgedAnswer, model: string): string {
         index,
         content_block: { type: 'text', text: '' },
       }),
-      ...ping(),
     );
     for (const segment of j.segments) {
       events.push(
@@ -812,7 +905,6 @@ function anthropicStreamOf(j: JudgedAnswer, model: string): string {
           input: {},
         },
       }),
-      ...ping(),
     );
     if (call.arguments !== '') {
       events.push(
@@ -865,6 +957,7 @@ async function attemptOnce(
   model: string,
   stream: boolean,
   tokens: readonly string[],
+  expectJson: boolean,
 ): Promise<AttemptOutcome> {
   let res: Response;
   try {
@@ -889,7 +982,7 @@ async function attemptOnce(
   if (raw.length > MAX_UPSTREAM_BYTES) {
     return { judged: null, trailRow: { status: res.status, code: '', model } };
   }
-  const { j, code } = stream ? judgeStream(res.status, raw, tokens) : judgeJson(res.status, raw, tokens);
+  const { j, code } = stream ? judgeStream(res.status, raw, tokens, expectJson) : judgeJson(res.status, raw, tokens);
   if (j.ok) return { judged: j, trailRow: null };
   const rowCode = code !== '' ? code : errorCodeOfSafe(raw);
   return { judged: null, trailRow: { status: res.status, code: rowCode.slice(0, 64), model } };
@@ -918,8 +1011,13 @@ async function servePrompt(
   manifestRow: PromptRow | undefined,
 ): Promise<ServedAnswer> {
   const stream = clientBody.stream === true;
-  const requirements = mergeRequirements(bodyRequirements(wire, clientBody), manifestRow?.requires);
+  const bodyReq = bodyRequirements(wire, clientBody);
+  const requirements = mergeRequirements(bodyReq, manifestRow?.requires);
   const tokens = requestTokens(wire, clientBody);
+  // JSON-mode is a fact of the client's own body (its response_format), not
+  // of the manifest row the arrival index lands on: only a body that itself
+  // asks for JSON has its streamed assembly held to the JSON bar.
+  const expectJson = bodyReq.json === true;
   const chain = candidateChain(brief, requirements);
   const trail: TrailRow[] = [];
   const startedAt = Date.now(); // control flow only; never reaches an output byte
@@ -928,7 +1026,7 @@ async function servePrompt(
     if (trail.length > 0 && Date.now() - startedAt > PROMPT_BUDGET_MS) break;
     const upstreamBody =
       wire === 'anthropic' ? anthropicToOpenAI(clientBody, candidate.id) : openAIUpstreamBody(clientBody, candidate.id);
-    const outcome = await attemptOnce(upstreamBody, candidate.id, stream, tokens);
+    const outcome = await attemptOnce(upstreamBody, candidate.id, stream, tokens, expectJson);
     if (outcome.trailRow !== null) trail.push(outcome.trailRow);
     const j = outcome.judged;
     if (j === null) continue;
