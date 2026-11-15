@@ -70,6 +70,29 @@ function sseFrame(data) {
   return `data: ${typeof data === 'string' ? data : JSON.stringify(data)}\n\n`;
 }
 
+function streamChunk(body, delta, finish) {
+  const upstreamModel = String(body.model).replace('openrouter/', '');
+  return {
+    id: 'chatcmpl-mock',
+    object: 'chat.completion.chunk',
+    created: 1767225600,
+    model: upstreamModel,
+    choices: [{ index: 0, delta, finish_reason: finish }],
+  };
+}
+
+function usageFrame(body) {
+  const upstreamModel = String(body.model).replace('openrouter/', '');
+  return sseFrame({
+    id: 'chatcmpl-mock',
+    object: 'chat.completion.chunk',
+    created: 1767225600,
+    model: upstreamModel,
+    choices: [],
+    usage: { prompt_tokens: 11, completion_tokens: 7, total_tokens: 18 },
+  });
+}
+
 function goodStream(body) {
   const upstreamModel = String(body.model).replace('openrouter/', '');
   const payload = goodPayload(body);
@@ -133,6 +156,63 @@ const gateway = createServer((req, res) => {
       // Mid-stream abort after the headers have flushed: no finish chunk, no [DONE].
       setTimeout(() => res.destroy(), 25);
       return;
+    }
+    if (model.includes('splitstream') && body.stream === true) {
+      // The good stream, but written in 7-byte slices (splitting JSON lines
+      // mid-payload across TCP chunks) with keep-alive comment frames mixed in.
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      const frames = goodStream(body).split('\n\n').filter((f) => f !== '');
+      const mixed = [frames[0], ': OPENROUTER PROCESSING', ...frames.slice(1, 3), ': OPENROUTER PROCESSING', ...frames.slice(3)];
+      const wire = mixed.map((f) => `${f}\n\n`).join('');
+      let at = 0;
+      const step = () => {
+        if (at >= wire.length) return res.end();
+        const next = Math.min(wire.length, at + 7);
+        res.write(wire.slice(at, next));
+        at = next;
+        setTimeout(step, 4);
+      };
+      step();
+      return;
+    }
+    if (model.includes('errstream') && body.stream === true) {
+      // Good content first, then a mid-stream error event: the whole attempt
+      // is poisoned and must fail over, leaking nothing.
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      return res.end([
+        sseFrame(streamChunk(body, { role: 'assistant', content: '' }, null)),
+        sseFrame(streamChunk(body, { content: 'garbage-without-the-token ' }, null)),
+        sseFrame({ id: 'chatcmpl-mock', error: { message: 'stream died mid-answer', code: 'stream_error' } }),
+        sseFrame(streamChunk(body, {}, 'stop')),
+        sseFrame('[DONE]'),
+      ].join(''));
+    }
+    if (model.includes('reasonfirst') && body.stream === true) {
+      // Reasoning deltas (both spellings) before the content: the answer is
+      // the content only; the scratch work must never reach the client.
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      return res.end([
+        sseFrame(streamChunk(body, { role: 'assistant', content: '' }, null)),
+        sseFrame(streamChunk(body, { reasoning: 'pondering the request ' }, null)),
+        sseFrame(streamChunk(body, { reasoning_content: 'still pondering ' }, null)),
+        sseFrame(streamChunk(body, { content: goodPayload(body) }, null)),
+        sseFrame(streamChunk(body, {}, 'stop')),
+        usageFrame(body),
+        sseFrame('[DONE]'),
+      ].join(''));
+    }
+    if (model.includes('reasononly') && body.stream === true) {
+      // The whole budget went to reasoning; content stays empty: a failed
+      // attempt that must fail over, exactly like an empty 200.
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      return res.end([
+        sseFrame(streamChunk(body, { role: 'assistant', content: '' }, null)),
+        sseFrame(streamChunk(body, { reasoning: 'deep thought, no answer ' }, null)),
+        sseFrame(streamChunk(body, { reasoning_content: 'more thought' }, null)),
+        sseFrame(streamChunk(body, {}, 'stop')),
+        usageFrame(body),
+        sseFrame('[DONE]'),
+      ].join(''));
     }
     if (body.stream === true) {
       res.writeHead(200, { 'content-type': 'text/event-stream' });
@@ -361,8 +441,8 @@ async function scenarioRealBrief() {
 
   const p05 = await call(port, '/v1/messages', bodyOf('p05'), { 'x-api-key': 'k', 'anthropic-version': '2023-06-01' });
   const p05Json = JSON.parse(p05.text);
-  check('tools prompt routed to best tools-capable model (inkling-2-small, 1475)',
-    gatewayLog.at(-1)?.model === 'openrouter/thinkingmachines/inkling-2-small:free', JSON.stringify(gatewayLog.at(-1)));
+  check('tools prompt routed to nemotron-3.5-super-vl (inkling never dialled after Fix A)',
+    gatewayLog.at(-1)?.model === 'openrouter/nvidia/nemotron-3.5-super-vl:free', JSON.stringify(gatewayLog.at(-1)));
   check('anthropic answer shape: type message + text block with token',
     p05Json.type === 'message' && p05Json.content[0].type === 'text' && p05Json.content[0].text.includes('YARROW-4506'));
   check('anthropic usage mapped from gateway usage', p05Json.usage.input_tokens === 11 && p05Json.usage.output_tokens === 7);
@@ -444,8 +524,8 @@ async function scenarioAnthropicStream() {
     const data = JSON.parse(f.split('\ndata: ')[1]);
     return { name, data };
   });
-  check('event order is the Anthropic lifecycle', eq(events.map((e) => e.name), [
-    'message_start', 'content_block_start', 'ping', 'content_block_delta', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop',
+  check('event order is exactly the Anthropic lifecycle (no ping, nothing extra)', eq(events.map((e) => e.name), [
+    'message_start', 'content_block_start', 'content_block_delta', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop',
   ]), JSON.stringify(events.map((e) => e.name)));
   check('message_start carries the real input usage', events[0].data.message.usage.input_tokens === 11);
   check('message_delta carries stop_reason + output usage',
@@ -596,6 +676,132 @@ async function scenarioTimeout() {
   await stopEntry(child);
 }
 
+/** The answer text of a client response, whichever wire/shape it arrived in. */
+function extractAnswerText(api, stream, text) {
+  if (!stream) {
+    const j = JSON.parse(text);
+    if (api === 'openai') return j.choices?.[0]?.message?.content ?? '';
+    return (j.content ?? []).filter((b) => b.type === 'text').map((b) => b.text).join('');
+  }
+  let out = '';
+  for (const frame of text.split('\n\n')) {
+    const line = frame.split('\n').find((l) => l.startsWith('data: '));
+    if (!line) continue;
+    const data = line.slice(6);
+    if (data === '[DONE]') continue;
+    let chunk;
+    try {
+      chunk = JSON.parse(data);
+    } catch {
+      continue;
+    }
+    if (api === 'openai') {
+      const c = chunk.choices?.[0]?.delta?.content;
+      if (typeof c === 'string') out += c;
+    } else if (chunk.type === 'content_block_delta' && chunk.delta?.type === 'text_delta') {
+      out += chunk.delta.text;
+    }
+  }
+  return out;
+}
+
+async function scenarioNeverDialRealBrief() {
+  console.log('\n== S15: Fix A — inkling never dialled on the real brief; nemotron serves all six ==');
+  const { child, port } = await startEntry(TRIAL0_BRIEF);
+  check('catalog still lists all 14 models (Fix A touches routing only)',
+    registeredBody.catalog.providers[0].models.length === 14);
+  check('catalog still contains inkling itself',
+    registeredBody.catalog.providers[0].models.some((m) => m.id.includes('inkling')));
+  const meta = {
+    p01: ['openai', false], p02: ['openai', true], p03: ['anthropic', true],
+    p04: ['openai', false], p05: ['anthropic', false], p06: ['anthropic', false],
+  };
+  gatewayLog.length = 0;
+  for (const id of ['p01', 'p02', 'p03', 'p04', 'p05', 'p06']) {
+    const [api, stream] = meta[id];
+    const body = bodyOf(id);
+    const token = JSON.stringify(body).match(/[A-Z]+-\d{4}/)[0];
+    const before = gatewayLog.length;
+    const headers = api === 'anthropic' ? { 'x-api-key': 'k', 'anthropic-version': '2023-06-01' } : {};
+    const r = await call(port, api === 'anthropic' ? '/v1/messages' : '/v1/chat/completions', body, headers);
+    const calls = gatewayLog.slice(before);
+    check(`${id}: exactly one gateway call, to nemotron-3.5-super-vl`,
+      calls.length === 1 && calls[0].model === 'openrouter/nvidia/nemotron-3.5-super-vl:free', JSON.stringify(calls));
+    check(`${id}: no failover trail`, trailOf(r.headers) === null);
+    check(`${id}: answer carries its token`, extractAnswerText(api, stream, r.text).includes(token),
+      extractAnswerText(api, stream, r.text).slice(0, 80));
+  }
+  check('inkling was never dialled in the whole trial', !gatewayLog.some((g) => String(g.model).includes('inkling')),
+    JSON.stringify(gatewayLog));
+  await stopEntry(child);
+}
+
+async function scenarioStreamHardening() {
+  console.log('\n== S16: Fix B — split chunks, keep-alives, mid-stream error, reasoning deltas ==');
+  const briefA = writeBrief([mockModel('splitstream', 1700)]);
+  const a = await startEntry(briefA);
+  gatewayLog.length = 0;
+  const ra = await call(a.port, '/v1/chat/completions', bodyOf('p02'), { accept: 'text/event-stream' });
+  const chunksA = ra.text.split('\n\n').filter((f) => f.includes('data: {')).map((f) => JSON.parse(f.split('data: ')[1]));
+  check('split+keep-alive stream served by the first model in one call',
+    gatewayLog.length === 1 && chunksA[0]?.model === 'openrouter/mock/splitstream:free', JSON.stringify(gatewayLog));
+  check('first emitted chunk carries role assistant with empty content',
+    chunksA[0]?.choices?.[0]?.delta?.role === 'assistant' && chunksA[0]?.choices?.[0]?.delta?.content === '');
+  check('token assembled intact across TCP splits', extractAnswerText('openai', true, ra.text) === 'COMET-3884',
+    extractAnswerText('openai', true, ra.text));
+  check('a finish chunk carries finish_reason stop',
+    chunksA.some((c) => c.choices?.[0]?.finish_reason === 'stop'));
+  check('usage chunk is the last data chunk, then exactly one [DONE]',
+    chunksA.at(-1)?.usage?.completion_tokens === 7 && ra.text.trimEnd().endsWith('data: [DONE]') && ra.text.split('[DONE]').length === 2);
+  check('no keep-alive comment leaked to the client', !ra.text.includes('OPENROUTER PROCESSING'));
+  await stopEntry(a.child);
+
+  const briefB = writeBrief([mockModel('errstream', 1700), mockModel('alpha', 1600)]);
+  const b = await startEntry(briefB);
+  gatewayLog.length = 0;
+  const rb = await call(b.port, '/v1/chat/completions', bodyOf('p02'), { accept: 'text/event-stream' });
+  check('mid-stream error event fails over to alpha',
+    eq(gatewayLog.map((g) => g.model), ['openrouter/mock/errstream:free', 'openrouter/mock/alpha:free']),
+    JSON.stringify(gatewayLog));
+  check('nothing of the poisoned stream leaked',
+    !rb.text.includes('garbage') && extractAnswerText('openai', true, rb.text).includes('COMET-3884'));
+  const trailB = trailOf(rb.headers);
+  check('error event left a trail row with its code',
+    Array.isArray(trailB) && trailB.length === 1 && trailB[0].code === 'stream_error', JSON.stringify(trailB));
+  await stopEntry(b.child);
+
+  const briefC = writeBrief([mockModel('reasonfirst', 1700)]);
+  const c = await startEntry(briefC);
+  gatewayLog.length = 0;
+  const rc = await call(c.port, '/v1/chat/completions', bodyOf('p02'), { accept: 'text/event-stream' });
+  check('reasoning-first stream served by the first model in one call', gatewayLog.length === 1, JSON.stringify(gatewayLog));
+  check('served content is the answer only — reasoning never repackaged as content',
+    extractAnswerText('openai', true, rc.text) === 'COMET-3884' && !rc.text.includes('pondering'),
+    extractAnswerText('openai', true, rc.text));
+  await stopEntry(c.child);
+
+  const briefD = writeBrief([mockModel('reasononly', 1700), mockModel('alpha', 1600)]);
+  const d = await startEntry(briefD);
+  gatewayLog.length = 0;
+  const rd = await call(d.port, '/v1/chat/completions', bodyOf('p02'), { accept: 'text/event-stream' });
+  check('reasoning-only stream (empty content) fails over',
+    eq(gatewayLog.map((g) => g.model), ['openrouter/mock/reasononly:free', 'openrouter/mock/alpha:free']),
+    JSON.stringify(gatewayLog));
+  check('fallback stream carries the token', extractAnswerText('openai', true, rd.text).includes('COMET-3884'));
+  await stopEntry(d.child);
+
+  const briefE = writeBrief([mockModel('splitstream', 1700)]);
+  const e = await startEntry(briefE);
+  const re = await call(e.port, '/v1/messages', bodyOf('p03'), { 'x-api-key': 'k', 'anthropic-version': '2023-06-01', accept: 'text/event-stream' });
+  const eventsE = re.text.split('\n\n').filter((f) => f.trim() !== '').map((f) => f.match(/^event: (.+)$/m)?.[1]);
+  check('anthropic lifecycle exact even for a split upstream stream',
+    eq(eventsE, ['message_start', 'content_block_start', 'content_block_delta', 'content_block_delta', 'content_block_stop', 'message_delta', 'message_stop']),
+    JSON.stringify(eventsE));
+  check('anthropic text assembled across splits carries the token',
+    extractAnswerText('anthropic', true, re.text).includes('FALCON-6712'));
+  await stopEntry(e.child);
+}
+
 // ---------------------------------------------------------------------------
 
 async function main() {
@@ -612,6 +818,8 @@ async function main() {
   await scenarioNoUsageAndAllFail();
   await scenarioDeterminism();
   await scenarioTimeout();
+  await scenarioNeverDialRealBrief();
+  await scenarioStreamHardening();
   const failedCount = results.filter((r) => !r.pass).length;
   console.log(`\n${results.length - failedCount}/${results.length} checks passed`);
   mockEnv.close();
